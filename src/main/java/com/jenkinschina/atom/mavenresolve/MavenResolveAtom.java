@@ -32,19 +32,31 @@ import org.w3c.dom.Node;
 import org.w3c.dom.NodeList;
 
 /**
- * Resolve Maven artifacts by coordinate and put them where the build can use them.
+ * Resolves Maven artifacts by coordinate and puts them where the build can use them.
  *
- * <p>Port of the resolve half of <em>repository-connector</em> (the deploy half is covered by
- * {@code artifact-publish}). The plugin hands resolution to Eclipse Aether; an atom carries no dependencies, so the
- * Maven rules that matter are written out here: repository layout, {@code maven-metadata.xml} for RELEASE / LATEST /
- * SNAPSHOT, and checksum verification with the policy Aether itself defaults to ({@code warn}).
+ * <p>Port of the resolve half of <em>repository-connector</em> (2.2.1). The plugin's build step
+ * {@code ArtifactResolver} hands resolution to Eclipse Aether; the per-artifact fields it resolves with live on
+ * {@code org.jvnet.hudson.plugins.repositoryconnector.Artifact} ({@code groupId}, {@code artifactId}, {@code version},
+ * {@code classifier}, {@code extension}, {@code targetFileName}, {@code failOnError}) and the step itself adds
+ * {@code repositoryId} and {@code targetDirectory}. That shape is what this atom reproduces; the upload half of the
+ * plugin is covered by the {@code artifact-publish} atom and is not repeated here.
  *
- * <p>Deliberate differences are listed in README.md and each one is asserted by {@code tools/check.py}.
+ * <p>An atom jar carries no dependencies, so the Maven rules that matter are written out: the repository layout
+ * (groupId with dots as slashes, then artifactId, then version, then {@code artifactId-version[-classifier].extension}),
+ * {@code maven-metadata.xml} for RELEASE / LATEST / SNAPSHOT, and checksum verification of the file the repository
+ * actually served.
+ *
+ * <p>Deliberate difference from the plugin, asserted by the smoke test: {@code checksumPolicy} defaults to
+ * {@code fail}. Aether (and therefore the plugin) defaults to {@code warn}, which keeps a jar whose published
+ * checksum disagrees with the bytes -- exactly the corruption a verifier exists to catch. Callers who want the
+ * plugin's behaviour set {@code warn}, which still verifies and reports but keeps the bytes.
  */
 public class MavenResolveAtom implements AtomTask {
 
     static final List<String> CHECKSUM_POLICIES = List.of("fail", "warn", "ignore");
     static final String METADATA = "maven-metadata.xml";
+    static final String LATEST = "LATEST";
+    static final String RELEASE = "RELEASE";
     static final int MAX_REDIRECTS = 5;
     static final int MAX_METADATA_BYTES = 1 << 20;
 
@@ -52,16 +64,18 @@ public class MavenResolveAtom implements AtomTask {
     public AtomResult run(AtomContext context) throws Exception {
         String repoUrl = context.getParam("repoUrl", "").trim();
         String rawCoordinates = context.getParam("coordinates", "");
-        String username = context.getParam("username", "");
-        String password = context.getParam("password", "");
-        String bearerToken = context.getParam("bearerToken", "");
-        String checksumPolicy = context.getParam("checksumPolicy", "warn").trim().toLowerCase(Locale.ROOT);
+        String checksumPolicy = context.getParam("checksumPolicy", "fail").trim().toLowerCase(Locale.ROOT);
         boolean failOnError = context.getBooleanParam("failOnError", true);
-        boolean copyToWorkspace = context.getBooleanParam("copyToWorkspace", true);
-        int timeoutSeconds = Math.max(5, Math.min(context.getIntParam("timeoutSeconds", 60), 600));
+        int timeoutSeconds = Math.max(1, Math.min(context.getIntParam("timeoutSeconds", 60), 600));
+
+        // credentials arrive either as form fields or through x-jenkins.secrets (a bound Jenkins credential);
+        // the secret wins only when the field is empty, so a job can still override a bound credential
+        String username = firstNonEmpty(context.getParam("username", ""), context.getSecret("username"));
+        String password = firstNonEmpty(context.getParam("password", ""), context.getSecret("password"));
 
         if (repoUrl.isEmpty()) {
-            return AtomResult.error(ErrorType.USER, 40002, "repoUrl is required");
+            return AtomResult.error(ErrorType.USER, 40002,
+                    "repoUrl is required (for example https://repo1.maven.org/maven2)");
         }
         String base = stripTrailingSlash(repoUrl);
         URI baseUri;
@@ -76,6 +90,9 @@ public class MavenResolveAtom implements AtomTask {
         if (!CHECKSUM_POLICIES.contains(checksumPolicy)) {
             return AtomResult.error(ErrorType.USER, 40001,
                     "unknown checksumPolicy '" + checksumPolicy + "'; known: " + String.join(", ", CHECKSUM_POLICIES));
+        }
+        if (password != null && !password.isEmpty() && (username == null || username.isEmpty())) {
+            return AtomResult.error(ErrorType.USER, 40001, "username is required when password is set");
         }
 
         List<Coord> coords = new ArrayList<>();
@@ -95,26 +112,27 @@ public class MavenResolveAtom implements AtomTask {
                     "coordinates is required: one groupId:artifactId:version[:extension[:classifier]] per line");
         }
 
+        String targetFileName = context.getParam("targetFileName", "").trim();
+        if (!targetFileName.isEmpty() && coords.size() > 1) {
+            return AtomResult.error(ErrorType.USER, 40009,
+                    "targetFileName needs exactly one coordinate; got " + coords.size());
+        }
+
         Path workspace = context.getWorkspace();
         Path localRepo;
         Path targetDir;
-        String targetFileName = context.getParam("targetFileName", "").trim();
         try {
             localRepo = path(context, context.getParam("localRepository", ".m2/repository"), "localRepository", false);
             targetDir = path(context, context.getParam("targetDirectory", ""), "targetDirectory", true);
         } catch (Failure f) {
             return AtomResult.error(f.type, f.code, f.getMessage());
         }
-        if (!targetFileName.isEmpty() && coords.size() > 1) {
-            return AtomResult.error(ErrorType.USER, 40009,
-                    "targetFileName needs exactly one coordinate; got " + coords.size());
-        }
 
         HttpClient client = HttpClient.newBuilder()
                 .connectTimeout(Duration.ofSeconds(Math.min(timeoutSeconds, 30)))
                 .followRedirects(HttpClient.Redirect.NEVER)
                 .build();
-        String auth = authorization(username, password, bearerToken);
+        String auth = authorization(username, password);
 
         List<String> files = new ArrayList<>();
         List<String> targets = new ArrayList<>();
@@ -130,7 +148,7 @@ public class MavenResolveAtom implements AtomTask {
         for (Coord coord : coords) {
             try {
                 One one = resolveOne(context, client, base, auth, coord, checksumPolicy, timeoutSeconds,
-                        localRepo, targetDir, targetFileName, copyToWorkspace);
+                        localRepo, targetDir, targetFileName);
                 resolved++;
                 bytes += one.bytes();
                 files.add(one.local().toString());
@@ -175,11 +193,13 @@ public class MavenResolveAtom implements AtomTask {
         outputs.put("urls", String.join("\n", urls));
         outputs.put("versions", String.join("\n", versions));
         outputs.put("checksums", String.join("\n", checksums));
+        if (!targets.isEmpty()) {
+            outputs.put("first", targets.get(0));
+        } else if (!files.isEmpty()) {
+            outputs.put("first", files.get(0));
+        }
         if (!errors.isEmpty()) {
             outputs.put("errors", String.join("\n", errors));
-        }
-        if (!files.isEmpty()) {
-            outputs.put("first", files.get(0));
         }
         context.log("[resolve] " + resolved + " artifact(s), " + bytes + " bytes"
                 + (failed == 0 ? "" : ", " + failed + " failed"));
@@ -201,13 +221,12 @@ public class MavenResolveAtom implements AtomTask {
             int timeoutSeconds,
             Path localRepo,
             Path targetDir,
-            String targetFileName,
-            boolean copyToWorkspace) throws Failure, IOException, InterruptedException {
+            String targetFileName) throws Failure, IOException, InterruptedException {
 
         Duration timeout = Duration.ofSeconds(timeoutSeconds);
         String version = coord.version();
         if (isPseudo(version)) {
-            version = pseudoVersion(client, base, auth, coord, timeout);
+            version = pseudoVersion(client, base, auth, coord, timeout, timeoutSeconds);
             context.log("[resolve] " + coord.groupId() + ":" + coord.artifactId() + " " + coord.version()
                     + " -> " + version);
         }
@@ -218,7 +237,7 @@ public class MavenResolveAtom implements AtomTask {
 
         String fileName;
         if (snapshot) {
-            Snapshot snapshotMeta = snapshotMetadata(client, base, auth, coord, version, timeout);
+            Snapshot snapshotMeta = snapshotMetadata(client, base, auth, coord, version, timeout, timeoutSeconds);
             fileName = snapshotMeta.localCopy()
                     ? coord.artifactId() + "-" + version + suffix + "." + extension
                     : coord.artifactId() + "-" + baseVersion + "-" + snapshotMeta.timestamp()
@@ -226,6 +245,7 @@ public class MavenResolveAtom implements AtomTask {
         } else {
             fileName = coord.artifactId() + "-" + version + suffix + "." + extension;
         }
+        // in the local cache a snapshot keeps its -SNAPSHOT name, as Maven's own local repository does
         String localName = coord.artifactId() + "-" + version + suffix + "." + extension;
 
         String groupPath = coord.groupId().replace('.', '/');
@@ -239,7 +259,7 @@ public class MavenResolveAtom implements AtomTask {
         context.log("[resolve] GET " + remoteUrl);
         Download download;
         try {
-            download = download(client, URI.create(remoteUrl), auth, timeout, part);
+            download = download(client, URI.create(remoteUrl), auth, timeout, timeoutSeconds, part);
         } catch (Failure f) {
             deleteQuietly(part);
             throw f;
@@ -247,7 +267,8 @@ public class MavenResolveAtom implements AtomTask {
 
         Checksum checksum;
         try {
-            checksum = verifyChecksum(client, URI.create(remoteUrl), auth, checksumPolicy, timeout, download);
+            checksum = verifyChecksum(client, URI.create(remoteUrl), auth, checksumPolicy, timeout, timeoutSeconds,
+                    download);
         } catch (Failure f) {
             deleteQuietly(part);
             throw f;
@@ -272,35 +293,34 @@ public class MavenResolveAtom implements AtomTask {
                     "readback of " + local + " is " + readback + ", downloaded bytes were " + download.sha1());
         }
 
-        Path target = null;
-        if (copyToWorkspace) {
-            String name = targetFileName.isEmpty() ? local.getFileName().toString() : targetFileName;
-            target = targetDir.resolve(name).normalize();
-            if (!target.startsWith(context.getWorkspace()) || target.equals(context.getWorkspace())) {
-                throw new Failure(ErrorType.USER, 40010, "target path leaves the workspace: " + name);
-            }
-            Path parent = target.getParent();
-            if (parent != null) {
-                Files.createDirectories(parent);
-            }
-            Files.copy(local, target, StandardCopyOption.REPLACE_EXISTING);
-            String copied = digest(target, "SHA-1");
-            if (!copied.equals(download.sha1())) {
-                throw new Failure(ErrorType.PLUGIN, 40012,
-                        "copy at " + target + " is " + copied + ", downloaded bytes were " + download.sha1());
-            }
+        String name = targetFileName.isEmpty() ? local.getFileName().toString() : targetFileName;
+        Path target = targetDir.resolve(name).normalize();
+        if (!target.startsWith(context.getWorkspace()) || target.equals(context.getWorkspace())) {
+            throw new Failure(ErrorType.USER, 40010, "target path leaves the workspace: " + name);
+        }
+        Path parent = target.getParent();
+        if (parent != null) {
+            Files.createDirectories(parent);
+        }
+        Files.copy(local, target, StandardCopyOption.REPLACE_EXISTING);
+        String copied = digest(target, "SHA-1");
+        if (!copied.equals(download.sha1())) {
+            throw new Failure(ErrorType.PLUGIN, 40012,
+                    "copy at " + target + " is " + copied + ", downloaded bytes were " + download.sha1());
         }
 
-        return new One(local, target, remoteUrl, download.bytes(), download.sha1(), version, snapshot, checksum.text());
+        return new One(local, target, remoteUrl, download.bytes(), download.sha1(), version, snapshot,
+                checksum.text());
     }
 
     // ------------------------------------------------------------------ coordinates and metadata
 
-    private String pseudoVersion(HttpClient client, String base, String auth, Coord coord, Duration timeout)
+    private String pseudoVersion(
+            HttpClient client, String base, String auth, Coord coord, Duration timeout, int timeoutSeconds)
             throws Failure, IOException, InterruptedException {
         String url = base + "/" + encodePath(coord.groupId().replace('.', '/')) + "/"
                 + encode(coord.artifactId()) + "/" + METADATA;
-        Document doc = metadata(client, url, auth, timeout);
+        Document doc = metadata(client, url, auth, timeout, timeoutSeconds);
         Element versioning = child(doc.getDocumentElement(), "versioning");
         if (versioning == null) {
             throw new Failure(ErrorType.THIRD_PART, 40007, "no <versioning> in " + url);
@@ -336,11 +356,11 @@ public class MavenResolveAtom implements AtomTask {
     }
 
     private Snapshot snapshotMetadata(
-            HttpClient client, String base, String auth, Coord coord, String version, Duration timeout)
-            throws Failure, IOException, InterruptedException {
+            HttpClient client, String base, String auth, Coord coord, String version, Duration timeout,
+            int timeoutSeconds) throws Failure, IOException, InterruptedException {
         String url = base + "/" + encodePath(coord.groupId().replace('.', '/')) + "/"
                 + encode(coord.artifactId()) + "/" + encode(version) + "/" + METADATA;
-        Document doc = metadata(client, url, auth, timeout);
+        Document doc = metadata(client, url, auth, timeout, timeoutSeconds);
         Element versioning = child(doc.getDocumentElement(), "versioning");
         Element snapshot = versioning == null ? null : child(versioning, "snapshot");
         if (snapshot == null) {
@@ -359,9 +379,9 @@ public class MavenResolveAtom implements AtomTask {
         return new Snapshot(timestamp.trim(), buildNumber.trim(), false);
     }
 
-    private Document metadata(HttpClient client, String url, String auth, Duration timeout)
+    private Document metadata(HttpClient client, String url, String auth, Duration timeout, int timeoutSeconds)
             throws Failure, IOException, InterruptedException {
-        Text response = text(client, URI.create(url), auth, timeout);
+        Text response = text(client, URI.create(url), auth, timeout, timeoutSeconds);
         if (response == null) {
             throw new Failure(ErrorType.THIRD_PART, 40007, "no " + METADATA + " at " + url);
         }
@@ -378,12 +398,12 @@ public class MavenResolveAtom implements AtomTask {
 
     // ------------------------------------------------------------------ HTTP
 
-    private Download download(HttpClient client, URI remote, String auth, Duration timeout, Path part)
+    private Download download(
+            HttpClient client, URI remote, String auth, Duration timeout, int timeoutSeconds, Path part)
             throws Failure, IOException, InterruptedException {
-        URI origin = remote;
         URI current = remote;
         for (int hop = 0; hop <= MAX_REDIRECTS; hop++) {
-            HttpResponse<InputStream> response = sendStream(client, current, auth, origin, timeout);
+            HttpResponse<InputStream> response = sendStream(client, current, auth, remote, timeout, timeoutSeconds);
             int status = response.statusCode();
             if (isRedirect(status)) {
                 Optional<String> location = response.headers().firstValue("Location");
@@ -401,9 +421,9 @@ public class MavenResolveAtom implements AtomTask {
             }
             checkStatus(status, current);
             long declared = response.headers().firstValueAsLong("Content-Length").orElse(-1L);
-            MessageDigest sha1 = sha1Digest();
-            MessageDigest sha256 = sha256Digest();
-            MessageDigest md5 = md5Digest();
+            MessageDigest sha1 = digestOf("SHA-1");
+            MessageDigest sha256 = digestOf("SHA-256");
+            MessageDigest md5 = digestOf("MD5");
             long bytes = 0;
             try (InputStream in = response.body(); var out = Files.newOutputStream(part)) {
                 byte[] buffer = new byte[64 * 1024];
@@ -427,11 +447,11 @@ public class MavenResolveAtom implements AtomTask {
     }
 
     /** Returns {@code null} when the resource is absent (404). */
-    private Text text(HttpClient client, URI url, String auth, Duration timeout)
+    private Text text(HttpClient client, URI url, String auth, Duration timeout, int timeoutSeconds)
             throws Failure, IOException, InterruptedException {
         URI current = url;
         for (int hop = 0; hop <= MAX_REDIRECTS; hop++) {
-            HttpResponse<String> response = sendText(client, current, auth, url, timeout);
+            HttpResponse<String> response = sendText(client, current, auth, url, timeout, timeoutSeconds);
             int status = response.statusCode();
             if (isRedirect(status)) {
                 Optional<String> location = response.headers().firstValue("Location");
@@ -460,15 +480,17 @@ public class MavenResolveAtom implements AtomTask {
     }
 
     private Checksum verifyChecksum(
-            HttpClient client, URI remote, String auth, String policy, Duration timeout, Download download)
-            throws Failure, IOException, InterruptedException {
+            HttpClient client, URI remote, String auth, String policy, Duration timeout, int timeoutSeconds,
+            Download download) throws Failure, IOException, InterruptedException {
         if ("ignore".equals(policy)) {
             return new Checksum("ignored", "ignored");
         }
-        String[][] candidates = {{"sha1", ".sha1", download.sha1()}, {"md5", ".md5", download.md5()},
-                {"sha256", ".sha256", download.sha256()}};
+        // the order a Maven repository is expected to publish in: sha1 first, then sha256 for newer publishers,
+        // and md5 only because old repositories still only have that
+        String[][] candidates = {{"sha1", ".sha1", download.sha1()}, {"sha256", ".sha256", download.sha256()},
+                {"md5", ".md5", download.md5()}};
         for (String[] candidate : candidates) {
-            Text response = text(client, URI.create(remote + candidate[1]), auth, timeout);
+            Text response = text(client, URI.create(remote + candidate[1]), auth, timeout, timeoutSeconds);
             if (response == null) {
                 continue;
             }
@@ -488,14 +510,14 @@ public class MavenResolveAtom implements AtomTask {
         }
         if ("fail".equals(policy)) {
             throw new Failure(ErrorType.THIRD_PART, 40005,
-                    "no checksum published for " + remote + " (.sha1, .md5, .sha256 all absent)");
+                    "no checksum published for " + remote + " (checked .sha1, .sha256, .md5)");
         }
         return new Checksum("none", "missing");
     }
 
     private HttpResponse<InputStream> sendStream(
-            HttpClient client, URI uri, String auth, URI origin, Duration timeout)
-            throws IOException, InterruptedException {
+            HttpClient client, URI uri, String auth, URI origin, Duration timeout, int timeoutSeconds)
+            throws Failure, IOException, InterruptedException {
         HttpRequest.Builder builder = HttpRequest.newBuilder(uri)
                 .timeout(timeout)
                 .header("User-Agent", "jenkins-atom-maven-resolve")
@@ -503,12 +525,17 @@ public class MavenResolveAtom implements AtomTask {
         if (auth != null && sameOrigin(uri, origin)) {
             builder.header("Authorization", auth);
         }
-        return client.send(builder.build(), HttpResponse.BodyHandlers.ofInputStream());
+        try {
+            return client.send(builder.build(), HttpResponse.BodyHandlers.ofInputStream());
+        } catch (HttpTimeoutException e) {
+            throw new Failure(ErrorType.THIRD_PART, 40013,
+                    "timed out after " + timeoutSeconds + "s downloading " + uri);
+        }
     }
 
     private HttpResponse<String> sendText(
-            HttpClient client, URI uri, String auth, URI origin, Duration timeout)
-            throws IOException, InterruptedException {
+            HttpClient client, URI uri, String auth, URI origin, Duration timeout, int timeoutSeconds)
+            throws Failure, IOException, InterruptedException {
         HttpRequest.Builder builder = HttpRequest.newBuilder(uri)
                 .timeout(timeout)
                 .header("Accept", "text/plain, application/xml, */*")
@@ -517,7 +544,12 @@ public class MavenResolveAtom implements AtomTask {
         if (auth != null && sameOrigin(uri, origin)) {
             builder.header("Authorization", auth);
         }
-        return client.send(builder.build(), HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+        try {
+            return client.send(builder.build(), HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+        } catch (HttpTimeoutException e) {
+            throw new Failure(ErrorType.THIRD_PART, 40013,
+                    "timed out after " + timeoutSeconds + "s fetching " + uri);
+        }
     }
 
     private void checkStatus(int status, URI url) throws Failure {
@@ -549,10 +581,7 @@ public class MavenResolveAtom implements AtomTask {
             resolved = workspace.resolve(resolved);
         }
         resolved = resolved.normalize();
-        if (!resolved.isAbsolute()) {
-            throw new Failure(ErrorType.USER, 40010, name + " is not a usable path: " + raw);
-        }
-        if (insideWorkspace && !(resolved.startsWith(workspace))) {
+        if (insideWorkspace && !resolved.startsWith(workspace)) {
             throw new Failure(ErrorType.USER, 40010, name + " leaves the workspace: " + raw);
         }
         return resolved;
@@ -561,9 +590,6 @@ public class MavenResolveAtom implements AtomTask {
     static boolean isPseudo(String version) {
         return LATEST.equals(version) || RELEASE.equals(version);
     }
-
-    static final String LATEST = "LATEST";
-    static final String RELEASE = "RELEASE";
 
     private static boolean isRedirect(int status) {
         return status == 301 || status == 302 || status == 303 || status == 307 || status == 308;
@@ -583,14 +609,18 @@ public class MavenResolveAtom implements AtomTask {
         return "https".equalsIgnoreCase(uri.getScheme()) ? 443 : 80;
     }
 
-    private static String authorization(String username, String password, String token) {
-        if (token != null && !token.isBlank()) {
-            return "Bearer " + token;
+    private static String firstNonEmpty(String value, String fallback) {
+        if (value != null && !value.isEmpty()) {
+            return value;
         }
-        if (username.isEmpty() && password.isEmpty()) {
+        return fallback == null ? "" : fallback;
+    }
+
+    private static String authorization(String username, String password) {
+        if (username == null || username.isEmpty()) {
             return null;
         }
-        String pair = username + ":" + password;
+        String pair = username + ":" + (password == null ? "" : password);
         return "Basic " + Base64.getEncoder().encodeToString(pair.getBytes(StandardCharsets.UTF_8));
     }
 
@@ -625,8 +655,7 @@ public class MavenResolveAtom implements AtomTask {
         if (text.isEmpty()) {
             return "";
         }
-        String[] parts = text.split("\\s+");
-        String token = parts[0].trim();
+        String token = text.split("\\s+")[0].trim();
         int slash = token.indexOf('/');
         return slash > 0 ? token.substring(0, slash) : token;
     }
@@ -648,18 +677,6 @@ public class MavenResolveAtom implements AtomTask {
     private static String text(Element parent, String name) {
         Element element = child(parent, name);
         return element == null ? null : element.getTextContent().trim();
-    }
-
-    private static MessageDigest sha1Digest() {
-        return digestOf("SHA-1");
-    }
-
-    private static MessageDigest sha256Digest() {
-        return digestOf("SHA-256");
-    }
-
-    private static MessageDigest md5Digest() {
-        return digestOf("MD5");
     }
 
     private static MessageDigest digestOf(String algorithm) {
@@ -725,7 +742,8 @@ public class MavenResolveAtom implements AtomTask {
             String classifier = parts.length > 4 && !parts[4].isBlank() ? parts[4].trim() : "";
             for (String value : new String[] {parts[0], parts[1], parts[2], extension, classifier}) {
                 if (value.matches(".*[\\s/:].*")) {
-                    throw new IllegalArgumentException("bad coordinate '" + line + "': illegal character in '" + value + "'");
+                    throw new IllegalArgumentException("bad coordinate '" + line + "': illegal character in '"
+                            + value + "'");
                 }
             }
             return new Coord(parts[0].trim(), parts[1].trim(), parts[2].trim(), extension, classifier);

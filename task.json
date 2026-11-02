@@ -2,7 +2,7 @@
   "atomCode": "maven-resolve",
   "name": "Resolve Maven artifact",
   "version": "1.0.0",
-  "description": "按 GAV 从 Maven 仓库取构件：布局、maven-metadata.xml（RELEASE/LATEST/SNAPSHOT）、校验和与目标目录复制。",
+  "description": "按 GAV（含 classifier/extension）从 Maven 仓库下载构件到工作区：仓库布局、maven-metadata.xml（RELEASE/LATEST/SNAPSHOT）、.sha1/.sha256 校验、targetFileName 重命名、Basic 凭据、超时与 failOnError。",
   "execution": {
     "packagePath": "maven-resolve.jar",
     "language": "java",
@@ -10,56 +10,44 @@
   },
   "input": {
     "repoUrl": {
-      "label": "仓库地址（如 https://repo1.maven.org/maven2）",
+      "label": "仓库地址（如 https://repo1.maven.org/maven2 或 Nexus 的 /repository/releases）",
       "type": "vuex-input",
       "default": ""
     },
     "coordinates": {
-      "label": "坐标，每行一个 groupId:artifactId:version[:extension[:classifier]]",
+      "label": "坐标，每行一个 groupId:artifactId:version[:extension[:classifier]]（版本可写 RELEASE / LATEST）",
       "type": "textarea",
       "default": ""
     },
     "username": {
-      "label": "用户名（可选）",
+      "label": "用户名（可选；留空则用绑定的同名凭据）",
       "type": "vuex-input",
       "default": ""
     },
     "password": {
-      "label": "密码（可选）",
-      "type": "vuex-input",
-      "default": "",
-      "isSensitive": true
-    },
-    "bearerToken": {
-      "label": "Bearer token（可选，优先于用户名密码）",
-      "type": "vuex-input",
-      "default": "",
-      "isSensitive": true
+      "label": "密码 / API Key（可选；留空则用绑定的同名凭据）",
+      "type": "password",
+      "default": ""
     },
     "localRepository": {
-      "label": "本地仓库目录（相对 workspace，或绝对路径/~）",
+      "label": "本地仓库目录（相对工作区，或绝对路径 / ~/.m2/repository）",
       "type": "vuex-input",
       "default": ".m2/repository"
     },
-    "copyToWorkspace": {
-      "label": "复制到工作区",
-      "type": "checkbox",
-      "default": "true"
-    },
     "targetDirectory": {
-      "label": "复制目标目录（相对 workspace）",
+      "label": "复制到工作区的目标目录（留空即工作区根）",
       "type": "vuex-input",
       "default": ""
     },
     "targetFileName": {
-      "label": "复制后的文件名（仅限单个坐标，可带子目录）",
+      "label": "复制后的文件名（单个坐标时可用，可带子目录）",
       "type": "vuex-input",
       "default": ""
     },
     "checksumPolicy": {
-      "label": "校验和策略",
+      "label": "校验和策略（fail：不一致或缺失即失败；warn：只告警；ignore：不查）",
       "type": "selector",
-      "default": "warn",
+      "default": "fail",
       "options": [
         "fail",
         "warn",
@@ -67,7 +55,7 @@
       ]
     },
     "failOnError": {
-      "label": "任一构件失败即失败",
+      "label": "任一构件失败即让这一步失败",
       "type": "checkbox",
       "default": "true"
     },
@@ -100,7 +88,7 @@
     },
     "targets": {
       "type": "string",
-      "description": "复制到工作区的路径，每行一个"
+      "description": "工作区中的副本路径，每行一个"
     },
     "urls": {
       "type": "string",
@@ -116,7 +104,7 @@
     },
     "first": {
       "type": "string",
-      "description": "第一个本地路径"
+      "description": "第一个工作区副本的路径"
     },
     "errors": {
       "type": "string",
@@ -127,6 +115,10 @@
     "protocol": "jenkins-1",
     "requires": {
       "runner": ">=0.4.0"
+    },
+    "secrets": {
+      "username": "",
+      "password": ""
     }
   }
 }

@@ -530,11 +530,13 @@ def _coord_bad():
 
 @check("target.escape.refused")
 def _target_escape():
-    ws = tmpdir()
+    home = tmpdir()
+    ws = home / "ws"
+    ws.mkdir()
     output, log = run(ws, {"repoUrl": URLS["a"], "coordinates": "com.acme:widget:1.0.0",
                            "targetFileName": "../evil.jar"})
     expect_status(output, 40010)
-    expect(not (ws.parent / "evil.jar").exists(), "a file was written outside the workspace")
+    expect(not (home / "evil.jar").exists(), "a file was written outside the workspace")
 
 
 @check("multiple.resolved")
