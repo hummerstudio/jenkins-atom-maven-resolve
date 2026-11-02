@@ -107,6 +107,8 @@ new_case() {    # a clean workspace and clean request logs, same servers
 }
 input() { printf '%s' "$1" >"$ws/input.json"; }
 requested() { grep -q "\"path\": \"$1\"," "$plain_log"; }
+ok_count=0
+ok() { ok_count=$((ok_count + 1)); printf 'ok   %s\n' "$1"; }
 
 # --- 1. a release jar: the exact layout path, the exact bytes, and the sha1 checked against those bytes
 new_case
@@ -127,6 +129,8 @@ grep -q "com.acme:widget=1.0.0" <<<"$(output "$ws" versions)" || fail "versions:
 # the .sha1 is a repository detail: it must not be copied into the workspace as an artifact
 [ "$(output "$ws" targets | wc -l | tr -d ' ')" = "1" ] || fail "more than one workspace copy: $(output "$ws" targets)"
 
+ok "release: exact layout path, exact bytes, sha1 verified"
+
 # --- 2. classifier and extension change the file name, not the directory
 new_case
 input "{\"repoUrl\": \"$plain\", \"coordinates\": \"com.acme:widget:1.0.0:jar:sources\\ncom.acme:bundle:2.0:zip\"}"
@@ -137,6 +141,8 @@ requested "/com/acme/bundle/2.0/bundle-2.0.zip" || fail "extension path: $(cat "
 [ -f "$ws/bundle-2.0.zip" ] || fail "extension artifact not copied"
 [ "$(output "$ws" resolved)" = "2" ] || fail "two artifacts: $(cat "$ws/output.json")"
 
+ok "classifier and extension change the file name only"
+
 # --- 3. targetFileName renames the copy, and may create sub-directories
 new_case
 input "{\"repoUrl\": \"$plain\", \"coordinates\": \"com.acme:widget:1.0.0\", \"targetFileName\": \"libs/app.jar\"}"
@@ -144,6 +150,8 @@ run "$ws" >"$ws/atom.log" 2>&1 || fail "targetFileName: $(cat "$ws/output.json")
 [ -f "$ws/libs/app.jar" ] || fail "targetFileName was not honoured: $(cat "$ws/output.json")"
 cmp -s "$ws/libs/app.jar" "$repo/com/acme/widget/1.0.0/widget-1.0.0.jar" || fail "renamed copy has the wrong bytes"
 grep -q "$ws/libs/app.jar" <<<"$(output "$ws" targets)" || fail "targets: $(output "$ws" targets)"
+
+ok "targetFileName renames the copy (with sub-directories)"
 
 # --- 4. a checksum that disagrees with the bytes fails the step, and leaves no artifact behind
 new_case
@@ -161,6 +169,8 @@ run "$ws" >"$ws/atom.log" 2>&1 || fail "checksumPolicy=warn: $(cat "$ws/output.j
 grep -q "sha1=mismatch" <<<"$(output "$ws" checksums)" || fail "warn must report the mismatch: $(output "$ws" checksums)"
 [ -f "$ws/badsha-1.0.jar" ] || fail "warn must keep the downloaded bytes"
 
+ok "a bad sha1 fails (40006) and leaves no artifact"
+
 # --- 5. sha256 when that is all the repository publishes; and no checksum at all
 new_case
 input "{\"repoUrl\": \"$plain\", \"coordinates\": \"com.acme:sha256only:1.0\"}"
@@ -177,6 +187,8 @@ input "{\"repoUrl\": \"$plain\", \"coordinates\": \"com.acme:unchecked:1.0\", \"
 run "$ws" >"$ws/atom.log" 2>&1 || fail "checksumPolicy=ignore: $(cat "$ws/output.json")"
 grep -q "ignored" <<<"$(output "$ws" checksums)" || fail "ignore must say so: $(output "$ws" checksums)"
 
+ok "sha256 fallback, warn keeps bytes, ignore skips"
+
 # --- 6. a 404 names the URL it asked for, and is a repository problem, not a caller mistake
 new_case
 input "{\"repoUrl\": \"$plain\", \"coordinates\": \"com.acme:absent:9.9\"}"
@@ -184,6 +196,8 @@ run "$ws" >"$ws/atom.log" 2>&1 && fail "a missing artifact must fail the step"
 grep -q '"errorCode":40003' "$ws/output.json" || fail "expected 40003: $(cat "$ws/output.json")"
 grep -q "not found: .*/com/acme/absent/9.9/absent-9.9.jar" "$ws/output.json" || fail "404 message: $(cat "$ws/output.json")"
 grep -q '"errorType":2' "$ws/output.json" || fail "404 is a repository problem (2): $(cat "$ws/output.json")"
+
+ok "404 names the URL (40003, repository problem)"
 
 # --- 7. 401 is a credentials problem: refused without a credential, working with a bound one, and the password
 #        reaches the repository as a Basic header -- and never the outputs
@@ -203,6 +217,8 @@ grep -q "\"authorization\": \"$(basic builder:s3cret)\"" "$auth_log" || fail "ba
 [ ! -f "$ws/.secrets.json" ] || fail "the runner must delete .secrets.json"
 if grep -q "s3cret" "$ws/output.json"; then fail "the password leaked into output.json"; fi
 
+ok "401 without credentials, then Basic from a bound secret"
+
 # --- 8. failOnError=false resolves what it can and reports the rest
 new_case
 input "{\"repoUrl\": \"$plain\", \"coordinates\": \"com.acme:absent:9.9\\ncom.acme:widget:1.0.0\", \"failOnError\": \"false\"}"
@@ -211,6 +227,8 @@ run "$ws" >"$ws/atom.log" 2>&1 || fail "failOnError=false must not fail: $(cat "
 [ "$(output "$ws" failed)" = "1" ] || fail "failed: $(cat "$ws/output.json")"
 grep -q "not found" <<<"$(output "$ws" errors)" || fail "errors: $(output "$ws" errors)"
 [ -f "$ws/widget-1.0.0.jar" ] || fail "the resolvable artifact was not copied"
+
+ok "failOnError=false resolves the rest and reports the failure"
 
 # --- 9. a slow repository times out as a timeout, not as a stack trace or a hang
 new_case
@@ -221,12 +239,16 @@ run "$ws" >"$ws/atom.log" 2>&1 && fail "a hanging repository must fail the step"
 grep -q '"errorCode":40013' "$ws/output.json" || fail "expected 40013: $(cat "$ws/output.json")"
 grep -q "timed out after 1s" "$ws/output.json" || fail "the failure must say it timed out: $(cat "$ws/output.json")"
 
+ok "a slow repository times out (40013)"
+
 # --- 10. a short read is not mistaken for an artifact
 new_case
 input "{\"repoUrl\": \"$broken_url\", \"coordinates\": \"com.acme:truncated:1.0\"}"
 run "$ws" >"$ws/atom.log" 2>&1 && fail "a truncated download must fail the step"
 grep -q "truncated download" "$ws/output.json" || fail "truncation not reported: $(cat "$ws/output.json")"
 [ ! -f "$ws/truncated-1.0.jar" ] || fail "a truncated file reached the workspace"
+
+ok "a short read is not an artifact (40008 truncated)"
 
 # --- 11. bad input is named, and a target cannot leave the workspace
 new_case
@@ -247,4 +269,6 @@ run "$ws" >"$ws/atom.log" 2>&1 && fail "an escaping targetFileName must be refus
 grep -q '"errorCode":40010' "$ws/output.json" || fail "expected 40010: $(cat "$ws/output.json")"
 [ ! -f "$gate/evil.jar" ] || fail "a file was written outside the workspace"
 
-echo "smoke ok: layout path, bytes, sha1/sha256 verification, classifier/extension, targetFileName, checksum policies, 404, 401+basic auth, failOnError, timeout, truncated download, bad input"
+ok "bad input is named and a target cannot escape the workspace"
+
+echo "smoke ok: all $((ok_count)) cases: layout path, bytes, sha1/sha256 verification, classifier/extension, targetFileName, checksum policies, 404, 401+basic auth, failOnError, timeout, truncated download, bad input"

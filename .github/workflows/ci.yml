@@ -8,7 +8,12 @@ on:
 
 jobs:
   atom:
-    runs-on: ubuntu-latest
+    # the smoke test drives a real local HTTP repository with python3 and bash, so both are POSIX jobs
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
@@ -23,12 +28,9 @@ jobs:
       - name: Build the SDK
         working-directory: jenkins-atom-sdk
         run: mvn -B -ntp -q package -DskipTests
-      - name: Build, behaviour checks and mutations
-        run: |
-          ./build.sh
-          python3 tools/check.py
-          python3 tools/mutations.py
+      - name: Build and smoke test the atom
+        run: ./tools/smoke.sh
       - uses: actions/upload-artifact@v4
         with:
-          name: maven-resolve-atom
+          name: maven-resolve-atom-${{ matrix.os }}
           path: dist/maven-resolve/
