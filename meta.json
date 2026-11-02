@@ -1,0 +1,11 @@
+{
+  "name": "Resolve Maven artifact",
+  "summary": "repository-connector 的解析侧移植：按 GAV 从 Maven 仓库取构件，含 RELEASE/LATEST/SNAPSHOT、校验和策略与目标目录复制。",
+  "author": "hummerstudio",
+  "license": "MIT",
+  "tags": [
+    "official-port",
+    "repository-connector"
+  ],
+  "homepage": "https://github.com/hummerstudio/jenkins-atom-maven-resolve"
+}

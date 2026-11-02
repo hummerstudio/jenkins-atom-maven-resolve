@@ -1,0 +1,132 @@
+{
+  "atomCode": "maven-resolve",
+  "name": "Resolve Maven artifact",
+  "version": "1.0.0",
+  "description": "按 GAV 从 Maven 仓库取构件：布局、maven-metadata.xml（RELEASE/LATEST/SNAPSHOT）、校验和与目标目录复制。",
+  "execution": {
+    "packagePath": "maven-resolve.jar",
+    "language": "java",
+    "target": "$atom_java_path -cp maven-resolve.jar com.jenkinschina.atom.sdk.AtomRunner"
+  },
+  "input": {
+    "repoUrl": {
+      "label": "仓库地址（如 https://repo1.maven.org/maven2）",
+      "type": "vuex-input",
+      "default": ""
+    },
+    "coordinates": {
+      "label": "坐标，每行一个 groupId:artifactId:version[:extension[:classifier]]",
+      "type": "textarea",
+      "default": ""
+    },
+    "username": {
+      "label": "用户名（可选）",
+      "type": "vuex-input",
+      "default": ""
+    },
+    "password": {
+      "label": "密码（可选）",
+      "type": "vuex-input",
+      "default": "",
+      "isSensitive": true
+    },
+    "bearerToken": {
+      "label": "Bearer token（可选，优先于用户名密码）",
+      "type": "vuex-input",
+      "default": "",
+      "isSensitive": true
+    },
+    "localRepository": {
+      "label": "本地仓库目录（相对 workspace，或绝对路径/~）",
+      "type": "vuex-input",
+      "default": ".m2/repository"
+    },
+    "copyToWorkspace": {
+      "label": "复制到工作区",
+      "type": "checkbox",
+      "default": "true"
+    },
+    "targetDirectory": {
+      "label": "复制目标目录（相对 workspace）",
+      "type": "vuex-input",
+      "default": ""
+    },
+    "targetFileName": {
+      "label": "复制后的文件名（仅限单个坐标，可带子目录）",
+      "type": "vuex-input",
+      "default": ""
+    },
+    "checksumPolicy": {
+      "label": "校验和策略",
+      "type": "selector",
+      "default": "warn",
+      "options": [
+        "fail",
+        "warn",
+        "ignore"
+      ]
+    },
+    "failOnError": {
+      "label": "任一构件失败即失败",
+      "type": "checkbox",
+      "default": "true"
+    },
+    "timeoutSeconds": {
+      "label": "单次请求超时（秒）",
+      "type": "vuex-input",
+      "default": "60"
+    }
+  },
+  "output": {
+    "resolved": {
+      "type": "string",
+      "description": "成功解析的构件数"
+    },
+    "failed": {
+      "type": "string",
+      "description": "失败的构件数（failOnError=false 时才可能非零）"
+    },
+    "snapshots": {
+      "type": "string",
+      "description": "其中快照版本的数量"
+    },
+    "bytes": {
+      "type": "string",
+      "description": "下载的字节数"
+    },
+    "files": {
+      "type": "string",
+      "description": "本地仓库中的绝对路径，每行一个"
+    },
+    "targets": {
+      "type": "string",
+      "description": "复制到工作区的路径，每行一个"
+    },
+    "urls": {
+      "type": "string",
+      "description": "实际下载的远端 URL，每行一个"
+    },
+    "versions": {
+      "type": "string",
+      "description": "groupId:artifactId=实际版本（RELEASE/LATEST 解析后）"
+    },
+    "checksums": {
+      "type": "string",
+      "description": "每个构件一行：<路径>\\t<算法>=<ok|mismatch|missing|ignored>"
+    },
+    "first": {
+      "type": "string",
+      "description": "第一个本地路径"
+    },
+    "errors": {
+      "type": "string",
+      "description": "failOnError=false 时每个失败一行"
+    }
+  },
+  "x-jenkins": {
+    "protocol": "jenkins-1",
+    "requires": {
+      "runner": ">=0.4.0"
+    }
+  }
+}
