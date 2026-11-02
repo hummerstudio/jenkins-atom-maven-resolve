@@ -600,7 +600,8 @@ def _copy_off():
     expect(output["status"] == "success", f"failed: {output.get('message')}")
     expect(not (ws / "widget-1.0.0.jar").exists(),
            f"copied although copyToWorkspace=false (targets={value(output, 'targets')!r}, "
-           f"workspace={sorted(p.name for p in ws.iterdir())})")
+           f"input={json.load(open(ws / 'input.json'))['copyToWorkspace']!r}, "
+           f"log={log[-400:]!r})")
     expect((repo_root(ws) / "com/acme/widget/1.0.0/widget-1.0.0.jar").exists(), "local repository file missing")
     expect(value(output, "targets") == "", f"targets={value(output, 'targets')}")
 

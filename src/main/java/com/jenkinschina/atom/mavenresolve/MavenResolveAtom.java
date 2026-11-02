@@ -435,6 +435,15 @@ public class MavenResolveAtom implements AtomTask {
                     md5.update(buffer, 0, read);
                     bytes += read;
                 }
+            } catch (IOException e) {
+                // a server that drops the connection mid-body surfaces as a read error, not as a short stream:
+                // what the client knows is that fewer bytes arrived than Content-Length promised
+                deleteQuietly(part);
+                if (declared >= 0 && declared != bytes) {
+                    throw new Failure(ErrorType.THIRD_PART, 40008,
+                            "truncated download of " + current + ": Content-Length " + declared + ", got " + bytes);
+                }
+                throw e;
             }
             if (declared >= 0 && declared != bytes) {
                 deleteQuietly(part);
