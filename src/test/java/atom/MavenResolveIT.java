@@ -41,6 +41,7 @@ class MavenResolveIT {
     private static Server auth;
     private static Server slow;
     private static Server broken;
+    private static Server errors;
 
     @BeforeAll
     static void startRepositories() throws Exception {
@@ -57,16 +58,56 @@ class MavenResolveIT {
         publish("com/acme/slow/1.0/slow-1.0.jar", "slow bytes", 4, "sha1");
         publish("com/acme/secret/1.0/secret-1.0.jar", "secret bytes", 6, "sha1");
         publish("com/acme/truncated/1.0/truncated-1.0.jar", "truncated bytes", 200, "sha1");
+        publish("com/acme/garbled/1.0/garbled-1.0.jar", "garbled bytes", 2);
+        Files.writeString(repo.resolve("com/acme/garbled/1.0/garbled-1.0.jar.sha1"),
+                "this is not a checksum\n", StandardCharsets.UTF_8);
+
+        // --- pseudo versions: what maven-metadata.xml says RELEASE and LATEST are
+        metadata("com/acme/widget", """
+                <metadata><groupId>com.acme</groupId><artifactId>widget</artifactId><versioning>
+                  <latest>1.0.0</latest><release>1.0.0</release>
+                  <versions><version>0.9</version><version>1.0.0</version></versions>
+                </versioning></metadata>
+                """);
+        // release declared as a snapshot is not a release: the versions list decides
+        publish("com/acme/relonly/0.8/relonly-0.8.jar", "relonly bytes", 3, "sha1");
+        metadata("com/acme/relonly", """
+                <metadata><versioning>
+                  <latest>1.0-SNAPSHOT</latest>
+                  <versions><version>0.8</version><version>1.0-SNAPSHOT</version></versions>
+                </versioning></metadata>
+                """);
+        metadata("com/acme/noversioning", "<metadata><groupId>com.acme</groupId></metadata>");
+        metadata("com/acme/noversions", """
+                <metadata><versioning><versions><version>1.0-SNAPSHOT</version></versions></versioning></metadata>
+                """);
+
+        // --- snapshots: the timestamped file name comes from the version's metadata
+        publish("com/acme/snap/2.0-SNAPSHOT/snap-2.0-20260101.120000-3.jar", "snapshot bytes", 2, "sha1");
+        metadata("com/acme/snap/2.0-SNAPSHOT", """
+                <metadata><versioning><snapshot>
+                  <timestamp>20260101.120000</timestamp><buildNumber>3</buildNumber>
+                </snapshot></versioning></metadata>
+                """);
+        publish("com/acme/local/1.0-SNAPSHOT/local-1.0-SNAPSHOT.jar", "local copy bytes", 2, "sha1");
+        metadata("com/acme/local/1.0-SNAPSHOT", """
+                <metadata><versioning><snapshot><localCopy>true</localCopy></snapshot></versioning></metadata>
+                """);
+        metadata("com/acme/nosnapmeta/1.0-SNAPSHOT",
+                "<metadata><versioning><lastUpdated>1</lastUpdated></versioning></metadata>");
+        metadata("com/acme/nosnaptime/1.0-SNAPSHOT",
+                "<metadata><versioning><snapshot><buildNumber>1</buildNumber></snapshot></versioning></metadata>");
 
         plain = Server.start("plain", repo);
         auth = Server.start("auth", repo, "--require-basic", "builder:s3cret");
         slow = Server.start("slow", repo, "--delay", "3");
         broken = Server.start("broken", repo, "--truncate", "/com/acme/truncated/1.0/truncated-1.0.jar");
+        errors = Server.start("errors", repo, "--status", "500:/com/acme/widget/1.0.0/widget-1.0.0.jar");
     }
 
     @AfterAll
     static void stopRepositories() {
-        for (Server server : List.of(plain, auth, slow, broken)) {
+        for (Server server : List.of(plain, auth, slow, broken, errors)) {
             if (server != null) {
                 server.close();
             }
@@ -316,12 +357,223 @@ class MavenResolveIT {
                 "a file was written outside the workspace");
     }
 
+    // ------------------------------------------------------------------ versions that come from metadata
+
+    @Test
+    @DisplayName("LATEST and RELEASE are read out of maven-metadata.xml and then resolved like any version")
+    void resolvesPseudoVersions() throws Exception {
+        long mark = plain.mark();
+        AtomResult latest = atom().input("repoUrl", plain.url)
+                .input("coordinates", "com.acme:widget:LATEST")
+                .run();
+
+        latest.assertOk();
+        assertTrue(latest.field("versions").contains("com.acme:widget=1.0.0"),
+                "LATEST did not become the version the metadata names: " + latest.field("versions"));
+        assertTrue(requested(plain.since(mark), "/com/acme/widget/maven-metadata.xml"),
+                "the metadata was not fetched: " + plain.since(mark));
+        assertTrue(requested(plain.since(mark), "/com/acme/widget/1.0.0/widget-1.0.0.jar"),
+                "the resolved version's jar was not fetched: " + plain.since(mark));
+        assertTrue(latest.console().contains("LATEST -> 1.0.0"), latest.console());
+
+        AtomResult release = atom().input("repoUrl", plain.url)
+                .input("coordinates", "com.acme:relonly:RELEASE")
+                .run();
+        release.assertOk();
+        assertTrue(release.field("versions").contains("com.acme:relonly=0.8"),
+                "a release declared as a snapshot must not be used: " + release.field("versions"));
+        assertTrue(release.exists("relonly-0.8.jar"), release.file("output.json"));
+    }
+
+    @Test
+    @DisplayName("a snapshot's file name comes from its own metadata, and the local copy keeps -SNAPSHOT")
+    void resolvesSnapshots() throws Exception {
+        long mark = plain.mark();
+        AtomResult run = atom().input("repoUrl", plain.url)
+                .input("coordinates", "com.acme:snap:2.0-SNAPSHOT")
+                .run();
+
+        run.assertOk();
+        assertEquals("1", run.field("snapshots"), run.file("output.json"));
+        assertTrue(requested(plain.since(mark), "/com/acme/snap/2.0-SNAPSHOT/maven-metadata.xml"),
+                "the snapshot metadata was not fetched: " + plain.since(mark));
+        assertTrue(requested(plain.since(mark), "/com/acme/snap/2.0-SNAPSHOT/snap-2.0-20260101.120000-3.jar"),
+                "the timestamped file was not fetched: " + plain.since(mark));
+        assertTrue(run.exists("snap-2.0-SNAPSHOT.jar"),
+                "the target keeps the -SNAPSHOT name, as Maven's local repository does: " + run.field("targets"));
+        assertTrue(run.exists(".m2/repository/com/acme/snap/2.0-SNAPSHOT/snap-2.0-SNAPSHOT.jar"),
+                "the local repository copy must be named -SNAPSHOT");
+
+        AtomResult local = atom().input("repoUrl", plain.url)
+                .input("coordinates", "com.acme:local:1.0-SNAPSHOT")
+                .run();
+        local.assertOk();
+        assertTrue(local.exists("local-1.0-SNAPSHOT.jar"), local.file("output.json"));
+        assertEquals("1", local.field("snapshots"));
+    }
+
+    @Test
+    @DisplayName("metadata that cannot name a version is a repository problem with a message that says why")
+    void reportsUnusableMetadata() throws Exception {
+        AtomResult noVersioning = atom().input("repoUrl", plain.url)
+                .input("coordinates", "com.acme:noversioning:RELEASE").run();
+        noVersioning.assertRefused();
+        assertEquals("40007", noVersioning.field("errorCode"), noVersioning.file("output.json"));
+        assertTrue(noVersioning.field("message").contains("no <versioning>"), noVersioning.field("message"));
+
+        AtomResult noVersions = atom().input("repoUrl", plain.url)
+                .input("coordinates", "com.acme:noversions:RELEASE").run();
+        noVersions.assertRefused();
+        assertTrue(noVersions.field("message").contains("no usable version"), noVersions.field("message"));
+
+        AtomResult noMetadata = atom().input("repoUrl", plain.url)
+                .input("coordinates", "com.acme:nometa:LATEST").run();
+        noMetadata.assertRefused();
+        assertTrue(noMetadata.field("message").contains("no maven-metadata.xml"),
+                noMetadata.field("message"));
+
+        AtomResult noSnapshot = atom().input("repoUrl", plain.url)
+                .input("coordinates", "com.acme:nosnapmeta:1.0-SNAPSHOT").run();
+        noSnapshot.assertRefused();
+        assertTrue(noSnapshot.field("message").contains("no <snapshot>"), noSnapshot.field("message"));
+
+        AtomResult noStamp = atom().input("repoUrl", plain.url)
+                .input("coordinates", "com.acme:nosnaptime:1.0-SNAPSHOT").run();
+        noStamp.assertRefused();
+        assertTrue(noStamp.field("message").contains("no timestamp/buildNumber"), noStamp.field("message"));
+    }
+
+    // ------------------------------------------------------------------ bad input and bad repositories
+
+    @Test
+    @DisplayName("a coordinate that is not g:a:v[:ext[:classifier]] is refused with the shape it wanted")
+    void refusesBadCoordinates() throws Exception {
+        for (String line : List.of("com.acme.widget", "com.acme::1.0", "a:b:c:d:e:f", "com.acme:widget:1.0:ja r")) {
+            AtomResult run = atom().input("repoUrl", plain.url).input("coordinates", line).run();
+            run.assertRefused();
+            assertEquals("40001", run.field("errorCode"), "coordinate '" + line + "':\n" + run);
+            assertTrue(run.field("message").contains("bad coordinate"), run.field("message"));
+        }
+    }
+
+    @Test
+    @DisplayName("repoUrl has to be an http(s) URL, the policy has to be known, and a password needs a username")
+    void refusesBadRepositorySettings() throws Exception {
+        AtomResult notAUrl = atom().input("repoUrl", "not a url").input("coordinates", "a:b:1").run();
+        notAUrl.assertRefused();
+        assertEquals("40002", notAUrl.field("errorCode"), notAUrl.file("output.json"));
+        assertTrue(notAUrl.field("message").contains("not a URL"), notAUrl.field("message"));
+
+        AtomResult ftp = atom().input("repoUrl", "ftp://repo.example.com/maven2")
+                .input("coordinates", "a:b:1").run();
+        ftp.assertRefused();
+        assertEquals("40002", ftp.field("errorCode"), ftp.file("output.json"));
+        assertTrue(ftp.field("message").contains("http or https"), ftp.field("message"));
+
+        AtomResult policy = atom().input("repoUrl", plain.url).input("coordinates", "a:b:1")
+                .input("checksumPolicy", "maybe").run();
+        policy.assertRefused();
+        assertEquals("40001", policy.field("errorCode"), policy.file("output.json"));
+        assertTrue(policy.field("message").contains("fail, warn, ignore"), policy.field("message"));
+
+        AtomResult password = atom().input("repoUrl", plain.url).input("coordinates", "a:b:1")
+                .input("password", "s3cret").run();
+        password.assertRefused();
+        assertEquals("40001", password.field("errorCode"), password.file("output.json"));
+        assertTrue(password.field("message").contains("username is required"), password.field("message"));
+        assertFalse(password.file("output.json").contains("s3cret"), "the password leaked into output.json");
+    }
+
+    @Test
+    @DisplayName("a repository that is not listening is an I/O failure, and failOnError=false carries on")
+    void reportsAnUnreachableRepository() throws Exception {
+        int closed = freePort();
+        AtomResult failed = atom().input("repoUrl", "http://127.0.0.1:" + closed)
+                .input("coordinates", "com.acme:widget:1.0.0").input("timeoutSeconds", "2").run();
+
+        failed.assertRefused();
+        assertEquals("40008", failed.field("errorCode"), failed.file("output.json"));
+        assertEquals("2", failed.field("errorType"), "a closed port is an I/O failure of the third party:\n" + failed);
+        assertTrue(failed.field("message").contains("I/O with the repository"), failed.field("message"));
+
+        AtomResult continued = atom().input("repoUrl", "http://127.0.0.1:" + closed)
+                .input("coordinates", "com.acme:widget:1.0.0").input("timeoutSeconds", "2")
+                .input("failOnError", "false").run();
+
+        continued.assertOk();
+        assertEquals("0", continued.field("resolved"), continued.file("output.json"));
+        assertEquals("1", continued.field("failed"), continued.file("output.json"));
+        assertTrue(continued.field("errors").contains("I/O with the repository"), continued.field("errors"));
+        assertTrue(continued.console().contains("[resolve] warning:"), continued.console());
+    }
+
+    @Test
+    @DisplayName("a 500 is not a missing artifact, and it names the status")
+    void reportsAServerError() throws Exception {
+        AtomResult run = atom().input("repoUrl", errors.url)
+                .input("coordinates", "com.acme:widget:1.0.0").run();
+
+        run.assertRefused();
+        assertEquals("40008", run.field("errorCode"), run.file("output.json"));
+        assertEquals("2", run.field("errorType"), run.file("output.json"));
+        assertTrue(run.field("message").contains("HTTP 500"), run.field("message"));
+    }
+
+    @Test
+    @DisplayName("a checksum file that is not a checksum is the same as none: fail refuses, warn keeps and says so")
+    void handlesAnUnusableChecksum() throws Exception {
+        AtomResult failed = atom().input("repoUrl", plain.url)
+                .input("coordinates", "com.acme:garbled:1.0").run();
+        failed.assertRefused();
+        assertEquals("40005", failed.field("errorCode"), failed.file("output.json"));
+        assertTrue(failed.field("message").contains("no checksum published"), failed.field("message"));
+
+        AtomResult warned = atom().input("repoUrl", plain.url)
+                .input("coordinates", "com.acme:garbled:1.0").input("checksumPolicy", "warn").run();
+        warned.assertOk();
+        assertTrue(warned.field("checksums").contains("none=missing"),
+                "warn must report that nothing was verified: " + warned.field("checksums"));
+        assertTrue(warned.exists("garbled-1.0.jar"), "warn must keep the downloaded bytes");
+        assertTrue(warned.console().contains("no checksum published"), warned.console());
+    }
+
+    @Test
+    @DisplayName("a target directory outside the workspace is refused, and a trailing slash on repoUrl is fine")
+    void gatesTheTargetDirectory() throws Exception {
+        AtomResult escape = atom().input("repoUrl", plain.url)
+                .input("coordinates", "com.acme:widget:1.0.0")
+                .input("targetDirectory", "../outside").run();
+        escape.assertRefused();
+        assertEquals("40010", escape.field("errorCode"), escape.file("output.json"));
+        assertFalse(escape.exists("../outside/widget-1.0.0.jar"), "a file was written outside the workspace");
+
+        AtomResult slash = atom().input("repoUrl", plain.url + "/")
+                .input("coordinates", "com.acme:widget:1.0.0").run();
+        slash.assertOk();
+        assertTrue(slash.field("urls").startsWith(plain.url + "/com/acme/"),
+                "the double slash must be stripped: " + slash.field("urls"));
+        assertTrue(slash.exists("widget-1.0.0.jar"), slash.file("output.json"));
+    }
+
+    private static int freePort() throws Exception {
+        try (java.net.ServerSocket socket = new java.net.ServerSocket(0)) {
+            return socket.getLocalPort();
+        }
+    }
+
     private static Atom atom() throws Exception {
         return Atom.of();
     }
 
     private static boolean requested(List<Map<String, Object>> requests, String path) {
         return requests.stream().anyMatch(entry -> path.equals(entry.get("path")));
+    }
+
+    /** One {@code maven-metadata.xml} at {@code <group path>/<artifact>/[<version>/]}. */
+    private static void metadata(String dir, String xml) throws Exception {
+        Path file = repo.resolve(dir).resolve("maven-metadata.xml");
+        Files.createDirectories(file.getParent());
+        Files.writeString(file, xml.strip(), StandardCharsets.UTF_8);
     }
 
     /** A fixture artifact plus the checksum files a repository publishes next to it. */
