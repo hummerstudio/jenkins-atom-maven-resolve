@@ -36,7 +36,7 @@ javap -c '...internal.impl.Maven2RepositoryLayoutFactory$Maven2RepositoryLayout'
 ```
 
 也就是 URL 布局 `<repo>/<groupId 点换斜杠>/<artifactId>/<version>/<artifactId>-<version>[-<classifier>].<extension>`，
-本原子的 `download()` 就按这条规则拼，`tools/smoke.sh` 用假仓库的请求日志断言请求路径逐字节相同。
+本原子的 `download()` 就按这条规则拼，`MavenResolveIT` 用假仓库的请求日志断言请求路径逐字节相同。
 
 ## 入参与出参
 
@@ -59,7 +59,7 @@ javap -c '...internal.impl.Maven2RepositoryLayoutFactory$Maven2RepositoryLayout'
   `Failed to resolve %s - %s` 的行为一致。
 - 凭据用 Basic 认证，只发给与原始仓库同 scheme/host/port 的请求。
 
-## 与插件不同的地方（刻意，且被 smoke 断言）
+## 与插件不同的地方（刻意，且被集成测试断言）
 
 1. **不用 Aether，不读缓存**：每次都从仓库取，本地仓库只是落盘的布局。`localRepository` 默认放在工作区
    （`<workspace>/.m2/repository`），要共享 Maven 的缓存就写 `~/.m2/repository`。
@@ -95,12 +95,11 @@ javap -c '...internal.impl.Maven2RepositoryLayoutFactory$Maven2RepositoryLayout'
 ## 构建与测试
 
 ```bash
-./build.sh            # 需要 ../jenkins-atom-sdk/target/jenkins-atom-sdk-*.jar
-./tools/smoke.sh      # 起本地假 Maven 仓库（真 HTTP），逐条断言
+mvn verify            # 需要 ../jenkins-atom-sdk/target/jenkins-atom-sdk-*.jar；构建 + JUnit 集成测试
 ```
 
-`tools/smoke.sh` 用 `tools/fake_maven_repo.py` 把一棵按 Maven 2 布局摆好的目录树用 HTTP 提供出去，并记录每个
-请求的路径/Authorization；断言用的期望值（路径、字节、SHA-1、Basic 头）都在脚本里自己算，不读原子的输出。
+`MavenResolveIT` 用 `tools/fake_maven_repo.py` 把一棵按 Maven 2 布局摆好的目录树用 HTTP 提供出去，并记录每个
+请求的路径/Authorization；断言用的期望值（路径、字节、SHA-1、Basic 头）都在测试里自己算，不读原子的输出。
 覆盖：布局路径与请求头、下载字节与工作区副本、`.sha1`/`.sha256` 校验与 `fail`/`warn`/`ignore`、classifier 与
 extension、`targetFileName`（含子目录与越界）、404、401+Basic（含 `.secrets.json` 绑定与密码不外泄）、
 `failOnError=false`、超时、短读、坏入参。
